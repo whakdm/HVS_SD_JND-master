@@ -1,0 +1,357 @@
+from __future__ import print_function
+import logging
+import sys, os
+import torch.nn.functional as F
+import grad_cam_usage as grad_cam
+from models.AutoEncoder2 import Concatenation
+import torch
+import cv2
+
+import argparse
+from PIL import Image
+from torchvision import transforms
+import numpy as np
+
+import matplotlib.pyplot as plt
+import os
+
+# 确保保存目录存在
+os.makedirs("visualizations", exist_ok=True)
+
+def save_tensor_as_image(tensor, save_path, is_gray=False):
+    """
+    将PyTorch张量保存为图像
+    tensor: 输入张量，形状为 (C, H, W) 或 (H, W)
+    save_path: 保存路径（如 "visualizations/jnd.png"）
+    is_gray: 是否为灰度图（单通道）
+    """
+    # 移到CPU，转为numpy数组
+    tensor = tensor.detach().cpu().numpy()
+    # 调整维度为 (H, W, C)
+    if len(tensor.shape) == 3:
+        tensor = tensor.transpose(1, 2, 0)
+    # 归一化到 [0, 255] 并转为uint8
+    tensor = (tensor - tensor.min()) / (tensor.max() - tensor.min() + 1e-8) * 255
+    tensor = tensor.astype(np.uint8)
+    # 保存图像
+    if is_gray:
+        plt.imsave(save_path, tensor, cmap="jet")  # 用jet色彩映射增强灰度图可视化
+    else:
+        plt.imsave(save_path, tensor)
+    print(f"已保存图像: {save_path}")
+
+# 设置一系列学习的参数，学习率，batch_size 和 图像大小
+gpu_num = torch.cuda.device_count()
+ct = 0.000
+print_freq = 10
+base_lr = 1e-4
+batch_size = 4
+image_size = 176
+global_step = 0
+tot_epoch = 1000000
+tot_step = 2500000
+cur_lr = base_lr = 1e-4
+lr_decay = 0.1
+decay_interval = 2200000
+tb_logger = None
+logger = logging.getLogger("AutoEncoder")
+warmup_step = 0
+
+# 加载模型
+def load_model(model, f):
+    with open(f, 'rb') as f:
+        pretrained_dict = torch.load(f, map_location='cpu', weights_only=True)
+        model_dict = model.state_dict()
+        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict)
+    f = str(f)
+    if f.find('iter_') != -1 and f.find('.pth') != -1:
+        st = f.find('iter_') + 5
+        ed = f.find('.pth', st)
+        return int(f[st:ed])
+    else:
+        return 0
+
+# 加载图片
+def load_images(image_paths):
+    images = []
+    raw_images = []
+    image, raw_image = preprocess(image_paths)
+    images.append(image)
+    print("Images Path is: " + image_paths)
+    raw_images.append(raw_image)
+    return images, raw_images
+"""
+
+def preprocess(image_path):
+    image = Image.open(image_path).convert('RGB')
+    raw_image = cv2.imread(image_path)
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+    return transform(image), raw_image
+"""
+
+
+def preprocess(image_path):
+    image = Image.open(image_path).convert('RGB')
+    raw_image = cv2.imread(image_path)
+
+    # 添加Resize步骤，统一尺寸为 176x176（根据模型调整）
+    transform = transforms.Compose([
+        transforms.Resize((176, 176)),  # 关键：强制Resize到模型预期尺寸
+        transforms.ToTensor(),
+    ])
+    return transform(image), raw_image
+
+
+# 计算图片的 PSNR
+def psnr(original, contrast):
+    mse = torch.mean((contrast - original).pow(2))
+    if mse == 0:
+        return 100
+    PIXEL_MAX = 255.0
+    return 20 * torch.log10(PIXEL_MAX / torch.sqrt(mse))
+
+def get_device(cuda):
+    cuda = cuda and torch.cuda.is_available()
+    device = torch.device("cuda" if cuda else "cpu")
+    return device
+"""
+def get_device(cuda):
+    # 强制使用 CPU 调试（忽略 CUDA）
+    return torch.device("cpu")
+"""
+def get_type(device):
+    if (device.type == "cpu"):
+        torchType = torch.FloatTensor
+    else:
+        torchType = torch.cuda.FloatTensor
+    return torchType
+
+def generateCAM(feature, gradient, image_shape):
+    weights = F.adaptive_avg_pool2d(gradient, 1)
+    GCAM = torch.mul(feature, weights).sum(dim=1, keepdim=True)
+    GCAM = torch.abs(GCAM)
+    GCAM = F.relu(GCAM)
+    GCAM = F.interpolate(
+        GCAM, image_shape, mode="bilinear", align_corners=False
+    )
+    B, C, H, W = GCAM.shape
+    GCAM = GCAM.view(B, -1)
+    GCAM -= GCAM.min(dim=1, keepdim=True)[0]
+    GCAM /= GCAM.max(dim=1, keepdim=True)[0]
+    GCAM = GCAM.view(B, C, H, W)
+    return GCAM
+
+def stage1_proceed(images, cuda):
+    # 加载编码器的网络
+    from models.StageOneModel import ImageCompressor as ImC
+    model = ImC()
+
+    # 把预训练的模型给加载好
+    load_model(model, "checkpoints/iter_20000.pth.tar")
+    model.to(cuda)
+    model.eval()
+
+    # 使用编码器网络计算 Grad CAM
+    gcam = grad_cam.GradCAM(model=model)
+
+    # 将图像前向传播，这样能够获取到具体的特征层
+    images = images.to(cuda)
+    distortion_loss, clipped_recon_image, feature, F = gcam.forward(images)
+    clipped_recon_image = clipped_recon_image.squeeze(0)
+
+    # Grad-CAM
+    image_grad = gcam.backward(distortion_loss=distortion_loss)
+    GCAM = generateCAM(feature, feature.grad, gcam.image_shape)
+
+    # ========== 新增：保存Grad-CAM图 ==========
+    # GCAM是单通道注意力图，形状为 (B, 1, H, W)，取第一个样本
+    gcam_single = GCAM[0, 0]  # 转为 (H, W)
+    save_tensor_as_image(gcam_single, "visualizations/grad_cam.png", is_gray=True)
+
+
+    return clipped_recon_image, feature, GCAM, image_grad, F
+
+def GetFeature(images):
+    model = Concatenation()
+    load_model(model, "checkpoints/Satisfy.pth.tar")
+    device = get_device("cuda")
+    net = model.to(device)
+    device = get_device("cuda")
+    if (device.type == "cpu"):
+        torchType = torch.FloatTensor
+    else:
+        torchType = torch.cuda.FloatTensor
+    clipped_recon_image, feature, GCAM, grad, F = stage1_proceed(images, device)
+
+    # 输出梯度图像
+    _range = torch.max(grad) - torch.min(grad)
+    grad = (grad - torch.min(grad)) / _range
+    concat = torch.cat((images.to(device), GCAM.to(device)), 1)
+    concat = torch.cat((concat, torch.mul(GCAM, grad)), 1)
+
+    jnd = net(concat)
+    jnd = torch.nn.functional.interpolate(input=jnd, size=(176, 176), mode='bilinear',
+                                          align_corners=False)
+    jnd = torch.abs(jnd)
+    jnd = torch.clamp(jnd, 0, 1)
+
+    # 行列 176 * 176，是一张图片随即加入的噪声，非 1 即 -1
+    col, row = images.shape[2], images.shape[3]
+    mask = np.random.random((col, row))
+    randnum = np.zeros((col, row))
+    for i in range(col):
+        for j in range(row):
+            if mask[i][j] >= 0.5:
+                randnum[i][j] = 1
+            else:
+                randnum[i][j] = -1
+    # numpy 类型要转换成 torch 支持的类型，同时要是浮点类型的
+    randnum = torch.from_numpy(randnum)
+    randnum = randnum.to(device)
+    batch_img2_ori = images.to(device) + 15*randnum * jnd.to(device)
+    batch_img2_ori = torch.clamp(batch_img2_ori, 0, 1)
+    batch_img2_ori.requires_grad_()
+    clipped_recon_image2, feature2, GCAM2, image_grad2, F2 = stage1_proceed(batch_img2_ori, device)
+    return batch_img2_ori
+
+def HVS_SD_JND(picPath,args):
+    # 加载图像
+    device = get_device("cuda")
+    torchType = get_type(device)
+    images, raw_images = load_images(picPath)
+    images = torch.stack(images).to(device)
+
+    # 加载 stage one 的失真图像, lmbda 为 JND 的参数 lmbda
+    batch_img2_ori = GetJNDdistorted(images, lmbda=args.lmbda)
+    batch_img2_ori = batch_img2_ori.type(torchType)
+
+    # ========== 新增：保存原始图像和失真图像 ==========
+    # 原始图像（取第一个样本，形状为 (B, C, H, W) → (C, H, W)）
+    original_img = images[0]
+    save_tensor_as_image(original_img, "visualizations/original_image.png")
+
+    # 失真图像（取第一个样本）
+    distorted_img = batch_img2_ori[0]
+    save_tensor_as_image(distorted_img, "visualizations/distorted_image.png")
+
+
+    # 进入 stage two 的过程，但测试中用不到相关数据
+    batch_img2_ori.requires_grad_()
+    clipped_recon_image2, feature2, GCAM2, image_grad2, F2 = stage1_proceed(batch_img2_ori, device)
+
+    # 输出 PSNR 信息
+    psnr1 = psnr(images[0][0].unsqueeze(0).unsqueeze(0) * 255,
+                 batch_img2_ori[0][0].unsqueeze(0).unsqueeze(0) * 255).item()
+    psnr2 = psnr(images[0][1].unsqueeze(0).unsqueeze(0) * 255,
+                 batch_img2_ori[0][1].unsqueeze(0).unsqueeze(0) * 255).item()
+    psnr3 = psnr(images[0][2].unsqueeze(0).unsqueeze(0) * 255,
+                 batch_img2_ori[0][2].unsqueeze(0).unsqueeze(0) * 255).item()
+    total_psnr = psnr(images * 255, batch_img2_ori * 255).item()
+    print("Result-R PSNR:", psnr1)
+    print("Result-G PSNR:", psnr2)
+    print("Result-B PSNR:", psnr3)
+    print("Total PSNR: ", total_psnr)
+
+def GetJNDdistorted(images2, lmbda):
+    # 经过 stage one 的图像
+    device = get_device("cuda")
+    torchType = get_type(device)
+    clipped_recon_image, feature, GCAM, grad, F = stage1_proceed(images2, device)
+    _range = torch.max(grad) - torch.min(grad)
+    grad = (grad - torch.min(grad)) / _range
+
+    # 将梯度信息和 grad 和 grad-cam 融合
+    concat = torch.cat((images2, GCAM), 1)
+    concat = torch.cat((concat, torch.mul(GCAM, grad)), 1)
+
+    # 加载 JND 网络
+    model = Concatenation()
+    load_model(model, "checkpoints/Satisfy.pth.tar")
+    net = model.to(device)
+    jnd = net(concat)
+    jnd = torch.nn.functional.interpolate(input=jnd, size=(images2.shape[2], images2.shape[3]), mode='bilinear',
+                                          align_corners=False)
+    jnd = torch.abs(jnd)
+    jnd = torch.clamp(jnd, 0, 1)
+
+    # ========== 新增：保存JND图 ==========
+    # JND是单通道图，形状为 (B, 1, H, W)，取第一个样本
+    jnd_single = jnd[0, 0]  # 转为 (H, W)
+    save_tensor_as_image(jnd_single, "visualizations/jnd_map.png", is_gray=True)
+
+
+    # 一张图片随即加入的噪声，非 1 即 -1
+    col, row = images2.shape[2], images2.shape[3]
+    mask = np.random.random((col, row))
+    randnum = np.zeros((col, row))
+    for i in range(col):
+        for j in range(row):
+            if mask[i][j] >= 0.5:
+                randnum[i][j] = 1
+            else:
+                randnum[i][j] = -1
+
+    randnum = torch.from_numpy(randnum)
+    randnum = randnum.type(torchType)
+    batch_img2_ori = images2 + lmbda * randnum * jnd
+    batch_img2_ori = torch.clamp(batch_img2_ori, 0, 1)
+    return batch_img2_ori
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description='HVS_SD_JND')
+    parser.add_argument('--path', help='path of test pictures ', type=str,default=r"E:\TEST_CODE\Learn_DNNCODE\imgs\cat1.png")
+    parser.add_argument('--lmbda', help='lmbda of JND ', type=int, default=1)
+    args = parser.parse_args(argv)
+    return args
+
+""""
+def main(argv):
+    args = parse_args(argv)
+
+    # 设置原图图像路径
+    picPath = args.path
+    file_paths = []
+
+    # 取出所有图像
+    for root, dirs, files in os.walk(picPath):
+        for file in files:
+            file_path = os.path.join(root, file)
+            file_paths.append(file_path)
+
+    for path in file_paths:
+        HVS_SD_JND(path, args)
+"""
+
+def main(argv):
+    args = parse_args(argv)
+    picPath = args.path
+
+    file_paths = []
+    # 判断路径是文件还是文件夹
+    if os.path.isfile(picPath):
+        # 单张图像直接添加
+        file_paths.append(picPath)
+    else:
+        # 文件夹则遍历所有文件
+        for root, dirs, files in os.walk(picPath):
+            for file in files:
+                # 只处理图像文件（过滤非图像格式）
+                if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+                    file_path = os.path.join(root, file)
+                    file_paths.append(file_path)
+
+    # 打印找到的文件（调试用）
+    print(f"找到 {len(file_paths)} 个图像文件：")
+    for path in file_paths:
+        print(path)
+        HVS_SD_JND(path, args)
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+
+
+
