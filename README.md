@@ -1,3 +1,4 @@
+自存使用
 # HVS-Inspired Signal Degradation Network for Just Noticeable Difference Estimation
 This repository is the implementation of ["HVS-Inspired Signal Degradation Network for Just Noticeable Difference Estimation"](https://arxiv.org/abs/2208.07583) 
 
